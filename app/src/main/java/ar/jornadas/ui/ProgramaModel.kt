@@ -2,13 +2,14 @@ package ar.jornadas.ui
 
 import android.app.Application
 import androidx.lifecycle.*
-import ar.jornadas.Servicios
+import ar.jornadas.JornadasApp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.io.IOException
 
 class ProgramaModel(app: Application, private val estado: SavedStateHandle) : AndroidViewModel(app) {
-    private val servicios = Servicios(app)
+    private val servicios = (app as JornadasApp).servicios
     val mesa = servicios.mesa
     private val repo = servicios.agenda
     val charlas = repo.programa.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -38,8 +39,20 @@ class ProgramaModel(app: Application, private val estado: SavedStateHandle) : An
         }
         .stateIn(viewModelScope, SharingStarted.Eagerly, Cartelera.Esperando)
 
+    // La petición en curso, si hay una. Mientras siga activa, recargar() no lanza otra (pedido 44).
+    private var carga: Job? = null
+
+    init {
+        // Carga automática: una por proceso. Rotar recrea la Activity pero no este ViewModel, así que
+        // no vuelve a pasar por acá; y si la Activity se recrea con un ViewModel nuevo en el mismo
+        // proceso, el repositorio ya dio su única carga automática y no da otra.
+        if (repo.tomarCargaAutomatica()) recargar()
+    }
+
+    /** Actualización explícita. Si ya hay una petición en curso, se ignora: dos toques = un intento. */
     fun recargar() {
-        viewModelScope.launch {
+        if (carga?.isActive == true) return
+        carga = viewModelScope.launch {
             _cargando.value = true
             try {
                 repo.sincronizar()

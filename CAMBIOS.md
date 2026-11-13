@@ -418,3 +418,159 @@ Las dos sobreviven a la muerte del proceso. `rememberSaveable` es lo que ya usa 
 
 ### Para defenderlo oralmente
 > "El tema vivía en un `remember` del catálogo, que se borra cuando el catálogo sale de pantalla al abrir una ficha o al rotar. El día vivía en el ViewModel, que sobrevive a eso pero no a que Android mate el proceso. Pasé los dos filtros al `SavedStateHandle` del ViewModel, que Android guarda con la tarea y devuelve al recrearla; una tarea nueva arranca sin estado guardado y, por lo tanto, sin filtros. La pantalla ya no guarda ni escribe el estado: lo lee y llama a `elegirDia` o `elegirTema`. El filtrado pasó a una función pura con test."
+
+---
+
+## Pedido 44 · Control de descargas
+
+### Contexto
+La Mesa tiene un contador: **"Peticiones en esta sesión"**. Suma 1 cada vez que la app le pide el programa al servicio, aunque la petición falle, y vuelve a 0 cuando muere el proceso. El README pide que ese contador suba solo cuando corresponde:
+
+| Acción | Cuánto tiene que sumar |
+|---|---|
+| Abrir la app (proceso nuevo) | **1**, la carga automática |
+| Tocar Actualizar o Reintentar | **1** por toque… |
+| …pero dos toques mientras hay una petición en curso | **1** en total |
+| Rotar, entrar a una ficha, cambiar de pestaña, volver del fondo | **0** |
+| Tocar Actualizar después de que terminó una petición (bien o mal) | **1**: se puede volver a pedir |
+
+Y mientras se espera, **los filtros tienen que seguir funcionando**.
+
+Analogía: la app es una persona que llama por teléfono a la organización para pedir el programa. Al llegar al congreso llama **una vez** por su cuenta. Después llama solo cuando vos se lo pedís. Si le pedís que llame mientras ya está hablando, no cuelga para llamar de nuevo: espera a que termine esa llamada. Y no llama cada vez que te das vuelta o cambiás de página.
+
+### Problema
+La app llamaba desde **dos lugares automáticos** que se disparaban muchas veces:
+
+```kotlin
+// MainActivity.kt
+override fun onStart() {
+    super.onStart()
+    model.recargar()                      // cada vez que la Activity se vuelve visible
+}
+
+// Catalogo.kt
+LaunchedEffect(Unit) { model.recargar() } // cada vez que el catálogo aparece en pantalla
+```
+
+- **`onStart`** se ejecuta cada vez que la Activity se hace visible: al abrir, al **rotar** (Android destruye y recrea la Activity) y al **volver del fondo**.
+- **`LaunchedEffect(Unit)`** se ejecuta cada vez que el composable `Catalogo` **entra en pantalla**: al abrir, al **rotar**, al **volver de una ficha** y al **volver de otra pestaña**.
+
+| Acción | `onStart` | `LaunchedEffect` | Total (debía ser) |
+|---|---|---|---|
+| Abrir la app | +1 | +1 | **2** (1) |
+| Rotar | +1 | +1 | **2** (0) |
+| Volver de una ficha | – | +1 | **1** (0) |
+| Volver de Mi agenda o Mesa | – | +1 | **1** (0) |
+| Volver del fondo | +1 | – | **1** (0) |
+
+Además, **`recargar()` no se fijaba si ya había una petición en curso**. Cada toque lanzaba una nueva, así que dos toques eran dos peticiones en paralelo. La primera que terminaba apagaba la barra de progreso aunque la otra siguiera.
+
+Y había un problema de fondo: **cada ViewModel construía su propio contenedor** (`Servicios(app)`), con su propia base Room, su propio Retrofit y su propio servicio de prueba con su propio contador. Si la Activity se cerraba y se volvía a abrir en el mismo proceso, se armaba todo de nuevo. Así no se puede llevar la cuenta de "una por proceso".
+
+### Qué código cambié
+
+**1. `JornadasApp.kt` (nuevo): un solo contenedor por proceso**
+
+```kotlin
+class JornadasApp : Application() {
+    val servicios by lazy { Servicios(this) }
+}
+```
+
+Registrada en el manifest con `android:name=".JornadasApp"`. La `Application` vive exactamente lo mismo que el proceso, así que **una base, un Retrofit, un repositorio y un contador por proceso**. El ViewModel ya no fabrica nada: lo pide.
+
+```kotlin
+// ANTES (ProgramaModel)
+private val servicios = Servicios(app)                  // un contenedor nuevo por cada ViewModel
+// DESPUÉS
+private val servicios = (app as JornadasApp).servicios  // el único, el del proceso
+```
+
+Esta es la regla de la cátedra *"una sola instancia de la base"* y *"un único contenedor de dependencias en la Application"*.
+
+**2. `data/AgendaRepository.kt`: "ya hice la carga automática"**
+
+```kotlin
+private val cargaAutomaticaPedida = AtomicBoolean(false)
+
+fun tomarCargaAutomatica(): Boolean = cargaAutomaticaPedida.compareAndSet(false, true)
+```
+
+- Como el repositorio vive lo mismo que el proceso, esta marca también. Se "olvida" recién cuando Android mata el proceso, que es justo **"una carga automática por sesión (proceso)"**.
+- `compareAndSet(false, true)` hace en un solo paso *"si está en false, pasala a true y devolvé true; si ya estaba en true, devolvé false"*. La primera llamada del proceso gana y todas las demás reciben `false`.
+
+**3. `ui/ProgramaModel.kt`: la carga automática en `init`, y una petición a la vez**
+
+```kotlin
+private var carga: Job? = null
+
+init {
+    if (repo.tomarCargaAutomatica()) recargar()
+}
+
+fun recargar() {
+    if (carga?.isActive == true) return    // ya hay una en curso → este toque no hace nada
+    carga = viewModelScope.launch { … }
+}
+```
+
+- **`init`** se ejecuta **una vez por ViewModel**, y el ViewModel sobrevive a la rotación, así que rotar no vuelve a cargar. Si la Activity se cierra y se reabre en el mismo proceso, se crea un ViewModel nuevo, pero el repositorio ya dio su carga automática y responde `false`.
+- **`carga`** guarda la petición en curso (un `Job` de corrutina). Si sigue activa, `recargar()` sale sin hacer nada: **dos toques = un intento**. Cuando termina, bien o mal, el `Job` deja de estar activo y el siguiente toque vuelve a pedir.
+- Como nunca hay dos peticiones a la vez, `cargando` ya no se apaga antes de tiempo.
+
+**4. Se borraron los disparadores automáticos**
+- `MainActivity.onStart()` → eliminado.
+- `LaunchedEffect(Unit) { model.recargar() }` en `Catalogo` → eliminado.
+
+Ahora **solo hay dos formas de pedir el programa**: el `init` (una vez por proceso) y los botones Actualizar o Reintentar.
+
+**5. `MainActivity.kt`: configurar la Mesa antes de crear el ViewModel**
+
+```kotlin
+// ANTES
+model.mesa.disponible = intent.getBooleanExtra("servicio_disponible", true)
+
+// DESPUÉS
+(application as JornadasApp).servicios.mesa.disponible = intent.getBooleanExtra("servicio_disponible", true)
+```
+
+Este detalle aparece *por* el cambio. Antes, `model.mesa` **creaba el ViewModel** al accederlo. Ahora crear el ViewModel dispara la carga automática en `init`, así que la primera petición saldría **antes** de apagar el servicio, y el arranque sin señal del README (`--ez servicio_disponible false`) dejaría de funcionar. Configurando la Mesa desde el contenedor, el ViewModel todavía no existe y la primera petición ya sale con el servicio apagado.
+
+### Los filtros durante la espera
+No hizo falta tocar nada. Los chips de día y tema nunca se deshabilitan, la barra de progreso no bloquea la pantalla y, desde el pedido 43, los filtros viven en el ViewModel, independientes de la descarga. Se pueden cambiar durante los 8 segundos de la demora larga.
+
+### Una aclaración sobre "dos toques"
+Interpreté *"dos toques durante una petición agregan un intento"* como: **el primer toque lanza la petición y el segundo, mientras esa sigue en curso, se ignora**. Es el comportamiento clásico contra el doble toque, y encaja con *"tras éxito o falla se puede volver a pedir"*: el bloqueo dura solo lo que dura la petición.
+
+### Qué riesgo resuelvo
+- **Peticiones de más:** gasto de datos y batería, y carga innecesaria al servidor, que en la vida real cobra o limita por petición.
+- **Peticiones en paralelo** que competían entre sí y apagaban la barra de progreso antes de tiempo.
+- **Varias bases Room y varios Retrofit** si el ViewModel se recreaba. Ahora hay una instancia de cada cosa por proceso.
+
+### ¿Respeta MVVM?
+- **Vista:** ya no decide **cuándo** cargar. Solo avisa cuando el usuario toca un botón.
+- **ViewModel:** dueño de la carga. Decide la carga inicial en `init` y bloquea las peticiones duplicadas. Es el patrón de la cátedra: *"carga inicial en `init { … }`, y la función de carga es pública para que la UI pueda reintentar"*.
+- **Contenedor:** uno solo, en la `Application`, que es la regla para proyectos sin Hilt.
+
+### Evidencia (manual, con el contador de la Mesa)
+Antes de cada prueba, mirá **"Peticiones en esta sesión"** en Mesa.
+
+1. **Arranque:** cerrá la app desde Recientes y abrila → Mesa: **1**.
+2. **Cero extra:** rotá dos veces, entrá y salí de una ficha, pasá por Mi agenda y Mesa, mandá la app al fondo y volvé → Mesa: sigue en **1**.
+3. **Dos toques:** activá la demora larga, volvé a Programa y tocá Actualizar **dos veces seguidas** → al terminar, Mesa: **2**.
+4. **Filtros en espera:** con la demora larga, tocá Actualizar y, durante los 8 s, cambiá Día y Tema → la lista se filtra al instante.
+5. **Volver a pedir tras una falla:** apagá «Servicio disponible», tocá Actualizar y esperá a que falle → Mesa: **3**. Prendé el servicio, tocá Actualizar → Mesa: **4** y llega el programa.
+6. **Nueva sesión:**
+   ```bash
+   adb shell am kill ar.jornadas
+   ```
+   con la app en el fondo, y volvé desde Recientes → Mesa: **1** (contador nuevo, una carga automática).
+7. **Arranque sin señal:**
+   ```bash
+   adb shell pm clear ar.jornadas
+   adb shell am start -n ar.jornadas/.MainActivity --ez servicio_disponible false
+   ```
+   → «No se pudo descargar el programa» con Reintentar, y Mesa: **1**.
+
+### Para defenderlo oralmente
+> "La app pedía el programa desde `onStart` y desde un `LaunchedEffect` del catálogo, que se ejecutan al rotar, al volver de una ficha, al cambiar de pestaña y al volver del fondo. Además, cada toque lanzaba una petición nueva aunque hubiera otra en curso. Moví el contenedor a la `Application`, para tener una sola instancia de todo por proceso, y puse la carga automática en el `init` del ViewModel, protegida por una marca del repositorio que se consume una sola vez por proceso. `recargar()` guarda el `Job` en curso y, si sigue activo, ignora el toque. Así hay una carga por sesión y una por cada actualización explícita, y nada más."

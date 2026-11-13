@@ -13,7 +13,6 @@ import ar.jornadas.data.Charla
 
 @Composable
 fun Catalogo(model: ProgramaModel, abrir: (String) -> Unit) {
-    LaunchedEffect(Unit) { model.recargar() }
     val filtros by model.filtros.collectAsStateWithLifecycle()
     val cartelera by model.cartelera.collectAsStateWithLifecycle()
     val cargando by model.cargando.collectAsStateWithLifecycle()
