@@ -17,15 +17,34 @@ data class Charla(@PrimaryKey val id: String, val titulo: String, val tema: Stri
     val favorita: Boolean = false)
 
 @Dao
-interface CarteleraDao {
+abstract class CarteleraDao {
     @Query("SELECT * FROM charlas ORDER BY dia, hora, sala")
-    fun observar(): Flow<List<Charla>>
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun guardar(fichas: List<Charla>)
+    abstract fun observar(): Flow<List<Charla>>
 
     @Query("UPDATE charlas SET favorita = NOT favorita WHERE id = :id")
-    suspend fun alternar(id: String)
+    abstract suspend fun alternar(id: String)
+
+    @Query("SELECT * FROM charlas")
+    protected abstract suspend fun todas(): List<Charla>
+
+    @Query("DELETE FROM charlas")
+    protected abstract suspend fun vaciar()
+
+    @Insert
+    protected abstract suspend fun insertar(fichas: List<Charla>)
+
+    /**
+     * Aplica una instantánea completa del programa (pedido 42).
+     * Leer las marcas, fusionar y reescribir ocurre en UNA transacción: una marca que el usuario
+     * cambió mientras viajaba la petición ya está commiteada cuando la leemos, y un toque que
+     * llega durante la transacción espera a que termine. Ninguno de los dos se pierde.
+     */
+    @Transaction
+    open suspend fun aplicarEdicion(entrantes: List<Charla>) {
+        val fusionadas = EdicionPrograma.fusionar(todas(), entrantes)
+        vaciar()
+        insertar(fusionadas)
+    }
 }
 
 @Database(entities = [Charla::class], version = 1, exportSchema = false)
