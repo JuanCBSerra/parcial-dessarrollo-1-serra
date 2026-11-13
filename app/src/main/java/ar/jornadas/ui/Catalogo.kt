@@ -14,13 +14,12 @@ import ar.jornadas.data.Charla
 @Composable
 fun Catalogo(model: ProgramaModel, abrir: (String) -> Unit) {
     LaunchedEffect(Unit) { model.recargar() }
-    val dia by model.dia.collectAsStateWithLifecycle()
-    var tema by remember { mutableStateOf("Todos") }
+    val filtros by model.filtros.collectAsStateWithLifecycle()
     val cartelera by model.cartelera.collectAsStateWithLifecycle()
     val cargando by model.cargando.collectAsStateWithLifecycle()
-    Selector(listOf("Ambos días", "Día 1", "Día 2"), dia) { model.dia.value = it }
-    val temas = listOf("Todos", "Android", "Datos", "Calidad")
-    Selector(temas, temas.indexOf(tema)) { tema = temas[it] }
+    Selector(listOf("Ambos días", "Día 1", "Día 2"), filtros.dia) { model.elegirDia(it) }
+    val temas = listOf(Filtros.TODOS, "Android", "Datos", "Calidad")
+    Selector(temas, temas.indexOf(filtros.tema)) { model.elegirTema(temas[it]) }
     TextButton(onClick = model::recargar) { Text("Actualizar") }
     if (cargando) LinearProgressIndicator(Modifier.fillMaxWidth())
     when (val estado = cartelera) {
@@ -32,7 +31,7 @@ fun Catalogo(model: ProgramaModel, abrir: (String) -> Unit) {
         is Cartelera.Edicion -> {
             if (estado.datosGuardados) Text("Sin conexión: estás viendo los datos guardados.")
             if (estado.charlas.isEmpty()) Text("Sin charlas programadas")
-            else Grilla(estado.charlas.filter { (dia == 0 || it.dia == dia) && (tema == "Todos" || it.tema == tema) }, abrir)
+            else Grilla(filtros.aplicar(estado.charlas), abrir)
         }
     }
 }

@@ -7,12 +7,24 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.io.IOException
 
-class ProgramaModel(app: Application) : AndroidViewModel(app) {
+class ProgramaModel(app: Application, private val estado: SavedStateHandle) : AndroidViewModel(app) {
     private val servicios = Servicios(app)
     val mesa = servicios.mesa
     private val repo = servicios.agenda
     val charlas = repo.programa.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
-    val dia = MutableStateFlow(0)
+
+    // Los filtros se guardan en el SavedStateHandle: sobreviven a la rotación (el ViewModel sigue vivo)
+    // y también a que Android mate el proceso (se restauran del estado guardado de la tarea).
+    // Una tarea nueva no trae estado guardado, así que arranca con los valores por defecto.
+    val filtros: StateFlow<Filtros> = combine(
+        estado.getStateFlow(CLAVE_DIA, 0),
+        estado.getStateFlow(CLAVE_TEMA, Filtros.TODOS),
+    ) { dia, tema -> Filtros(dia, tema) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly,
+            Filtros(estado.get<Int>(CLAVE_DIA) ?: 0, estado.get<String>(CLAVE_TEMA) ?: Filtros.TODOS))
+
+    fun elegirDia(dia: Int) { estado[CLAVE_DIA] = dia }
+    fun elegirTema(tema: String) { estado[CLAVE_TEMA] = tema }
 
     private val _cargando = MutableStateFlow(false)
     val cargando: StateFlow<Boolean> = _cargando.asStateFlow()
@@ -41,4 +53,9 @@ class ProgramaModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun marcar(id: String) { viewModelScope.launch { repo.cambiarFavorita(id) } }
+
+    private companion object {
+        const val CLAVE_DIA = "filtro_dia"
+        const val CLAVE_TEMA = "filtro_tema"
+    }
 }

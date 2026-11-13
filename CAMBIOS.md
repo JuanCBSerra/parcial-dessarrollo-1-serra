@@ -297,3 +297,124 @@ Respeta la regla de la cátedra *"distinguir lista vacía de error: nunca mostra
 
 ### Para defenderlo oralmente
 > "El error reemplazaba a la lista, así que sin señal no veías nada aunque el programa estuviera guardado. Además, con solo la tabla de charlas no se distingue 'nunca descargué' de 'descargué un programa vacío'. Agregué una tabla `edicion` que se escribe en la misma transacción que las charlas, con una migración incremental que no borra nada y reconoce a quien ya tenía datos. La decisión de qué mostrar es una función pura con tres estados; el ViewModel la expone como un único `StateFlow` y la pantalla solo hace un `when`. Ahora el aviso va arriba de la lista, no en su lugar."
+
+---
+
+## Pedido 43 · Volver al punto de lectura
+
+### Contexto
+En el catálogo hay dos filtros: **día** (Ambos días, Día 1, Día 2) y **tema** (Todos, Android, Datos, Calidad). El README pide que, si elegís "Día 2 + Datos", abrís una charla y volvés, **los filtros sigan puestos** en estas situaciones:
+
+| Situación | Qué tiene que pasar |
+|---|---|
+| Abrir una ficha y volver | Siguen Día 2 + Datos → 2 resultados |
+| Rotar el teléfono | Siguen los filtros |
+| App al fondo y Android **mata el proceso** para liberar memoria; volvés desde Recientes | Vuelve a la ficha abierta y, al volver, **los dos filtros** siguen puestos |
+| Tarea nueva (abrir la app de cero) | Arranca **sin filtros** |
+
+Analogía: estás leyendo el programa con dos **señaladores** (uno para el día y otro para el tema). Si te levantás de la mesa (rotar, abrir una ficha) o alguien guarda tu carpeta en un cajón para hacer lugar (Android mata el proceso), al volver los señaladores tienen que estar donde los dejaste. Si empezás una lectura nueva, arrancás sin señaladores.
+
+### Problema
+Cada filtro se guardaba en un lugar distinto, y ninguno era el correcto:
+
+```kotlin
+// ProgramaModel.kt
+val dia = MutableStateFlow(0)                         // en el ViewModel, en memoria
+
+// Catalogo.kt
+var tema by remember { mutableStateOf("Todos") }      // en la pantalla, en memoria
+```
+
+**Dónde vive cada cosa:**
+
+| Lugar | Sobrevive a abrir una ficha | Sobrevive a rotar | Sobrevive a que Android mate el proceso |
+|---|---|---|---|
+| `remember` (en el composable) | ❌ | ❌ | ❌ |
+| ViewModel en memoria | ✅ | ✅ | ❌ |
+| `rememberSaveable` / `SavedStateHandle` | ✅ | ✅ | ✅ |
+
+- **El tema (`remember`)** se perdía apenas abrías una ficha. `Portada` reemplaza el catálogo por la ficha, así que el composable `Catalogo` **sale de pantalla** y todo lo que guardaba con `remember` se borra. Al volver arranca de cero con "Todos". Lo mismo al rotar, porque la Activity se recrea.
+- **El día (ViewModel)** sobrevivía a la ficha y a la rotación, porque el ViewModel sigue vivo. Pero si Android **mata el proceso**, el ViewModel muere con él y vuelve a "Ambos días".
+- **La ficha abierta** ya estaba bien: `Portada` la guarda con `rememberSaveable`. Por eso tras matar el proceso volvías a la ficha, pero al tocar "Volver" los filtros ya no estaban.
+
+### Qué código cambié
+
+**1. `ui/Filtros.kt` (nuevo): los dos filtros juntos, con su regla**
+
+```kotlin
+data class Filtros(val dia: Int = 0, val tema: String = TODOS) {
+    fun aplicar(charlas: List<Charla>): List<Charla> =
+        charlas.filter { (dia == 0 || it.dia == dia) && (tema == TODOS || it.tema == tema) }
+}
+```
+
+- Los dos filtros viajan juntos en un solo objeto.
+- El `filter` que antes estaba escrito en el composable pasa a una función pura testeable. La pantalla ya no decide qué charlas pasan.
+- `"Todos"` es una constante (`Filtros.TODOS`) y no un texto repetido en varios lugares.
+
+**2. `ui/ProgramaModel.kt`: los filtros en el `SavedStateHandle`**
+
+```kotlin
+class ProgramaModel(app: Application, private val estado: SavedStateHandle) : AndroidViewModel(app) {
+
+    val filtros: StateFlow<Filtros> = combine(
+        estado.getStateFlow(CLAVE_DIA, 0),
+        estado.getStateFlow(CLAVE_TEMA, Filtros.TODOS),
+    ) { dia, tema -> Filtros(dia, tema) }
+        .stateIn(…)
+
+    fun elegirDia(dia: Int) { estado[CLAVE_DIA] = dia }
+    fun elegirTema(tema: String) { estado[CLAVE_TEMA] = tema }
+```
+
+- **`SavedStateHandle`** es un "bolsillo" del ViewModel que Android guarda junto con la tarea. Cuando mata el proceso, guarda el bolsillo. Cuando volvés desde Recientes, crea un ViewModel nuevo y **le devuelve el bolsillo** con los valores que tenía.
+- Una **tarea nueva** no tiene bolsillo guardado, así que los filtros arrancan en sus valores por defecto. Eso cumple "una tarea nueva arranca sin filtros" sin código extra.
+- `getStateFlow` convierte cada valor del bolsillo en un flujo observable: cuando `elegirDia` escribe, el flujo emite y la pantalla se redibuja.
+- No hizo falta tocar `MainActivity`. La fábrica por defecto de `viewModels()` ya sabe construir un `AndroidViewModel` que pide `(Application, SavedStateHandle)`.
+- Se eliminó `val dia = MutableStateFlow(0)`, que era público y modificable. Ahora la pantalla **no escribe el estado**: llama a `elegirDia` o `elegirTema`, y el único que modifica es el ViewModel.
+
+**3. `ui/Catalogo.kt`: la pantalla lee y avisa, no guarda**
+
+```kotlin
+// ANTES
+val dia by model.dia.collectAsStateWithLifecycle()
+var tema by remember { mutableStateOf("Todos") }
+Selector(…, dia) { model.dia.value = it }                  // la pantalla escribía en el ViewModel
+Selector(temas, temas.indexOf(tema)) { tema = temas[it] }  // y guardaba el tema ella misma
+Grilla(fichas.filter { (dia == 0 || it.dia == dia) && (tema == "Todos" || it.tema == tema) }, abrir)
+
+// DESPUÉS
+val filtros by model.filtros.collectAsStateWithLifecycle()
+Selector(…, filtros.dia) { model.elegirDia(it) }
+Selector(temas, temas.indexOf(filtros.tema)) { model.elegirTema(temas[it]) }
+Grilla(filtros.aplicar(estado.charlas), abrir)
+```
+
+### Por qué `SavedStateHandle` y no `rememberSaveable`
+Las dos sobreviven a la muerte del proceso. `rememberSaveable` es lo que ya usa `Portada` para la sección y la ficha. Para los filtros elegí el ViewModel por dos razones:
+- **Son estado del catálogo que usa el ViewModel**, no un detalle visual de la pantalla. La cátedra dice que el estado de pantalla (como un filtro activo) vive en el ViewModel y la vista solo lo dibuja.
+- **Deja la puerta abierta al pedido 44**, donde el ViewModel va a necesitar los filtros al lado del estado de descarga.
+
+### Qué riesgo resuelvo
+- **Perder el punto de lectura** al abrir una ficha, rotar o volver tras la muerte del proceso.
+- **La pantalla modificaba el estado del ViewModel directamente** (`model.dia.value = it`). Ahora es de solo lectura y se cambia con funciones.
+- **La regla de filtrado estaba en el composable**, sin test. Ahora es pura y testeada.
+
+### ¿Respeta MVVM?
+- **Vista:** muestra los filtros y avisa cuando tocás un chip (`elegirDia`, `elegirTema`). No guarda nada.
+- **ViewModel:** dueño de los filtros. Los persiste en el `SavedStateHandle` y los expone como `StateFlow` de solo lectura.
+- **Regla pura:** `Filtros.aplicar`, sin Android, testeada en la JVM.
+
+### Evidencia
+- **Test JVM:** `app/src/test/java/ar/jornadas/ui/FiltrosTest.kt` arma un programa igual a `programa-1.json` y prueba sin filtros (12), **Día 2 + Datos (23 y 24, los dos del README)**, solo día, solo tema y programa vacío.
+- **Manual, ficha y rotación:** Programa → Día 2 → Datos → abrí «Cachés para viajeros» → Volver: quedan 2 resultados (Cachés para viajeros y Consultas observables). Rotá: siguen los 2.
+- **Manual, muerte del proceso:** Día 2 → Datos → abrí «Cachés para viajeros» y, con la ficha abierta:
+  ```bash
+  adb shell input keyevent KEYCODE_HOME
+  adb shell am kill ar.jornadas
+  ```
+  Volvé desde Recientes: aparece la ficha de «Cachés para viajeros». Tocá Volver: Día 2 y Datos siguen seleccionados, con 2 resultados.
+- **Manual, tarea nueva:** cerrá la app deslizándola en Recientes y abrila desde el ícono: arranca en Ambos días y Todos.
+
+### Para defenderlo oralmente
+> "El tema vivía en un `remember` del catálogo, que se borra cuando el catálogo sale de pantalla al abrir una ficha o al rotar. El día vivía en el ViewModel, que sobrevive a eso pero no a que Android mate el proceso. Pasé los dos filtros al `SavedStateHandle` del ViewModel, que Android guarda con la tarea y devuelve al recrearla; una tarea nueva arranca sin estado guardado y, por lo tanto, sin filtros. La pantalla ya no guarda ni escribe el estado: lo lee y llama a `elegirDia` o `elegirTema`. El filtrado pasó a una función pura con test."
