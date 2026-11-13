@@ -13,19 +13,29 @@ class ProgramaModel(app: Application) : AndroidViewModel(app) {
     private val repo = servicios.agenda
     val charlas = repo.programa.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
     val dia = MutableStateFlow(0)
-    val aviso = MutableStateFlow("")
-    val cargando = MutableStateFlow(false)
+
+    private val _cargando = MutableStateFlow(false)
+    val cargando: StateFlow<Boolean> = _cargando.asStateFlow()
+
+    // Resultado de la última petición TERMINADA. No se limpia al empezar otra: mientras se reintenta,
+    // el aviso de datos guardados (o el botón de reintento) sigue visible hasta que llega la respuesta.
+    private val ultimaFallo = MutableStateFlow(false)
+
+    val cartelera: StateFlow<Cartelera> = combine(repo.hayEdicion, charlas, ultimaFallo) { hayEdicion, lista, fallo ->
+            Cartelera.desde(hayEdicion, lista, fallo)
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, Cartelera.Esperando)
 
     fun recargar() {
         viewModelScope.launch {
-            cargando.value = true
-            aviso.value = ""
+            _cargando.value = true
             try {
                 repo.sincronizar()
+                ultimaFallo.value = false
             } catch (e: IOException) {
-                aviso.value = "No se pudo consultar el programa"
+                ultimaFallo.value = true
             } finally {
-                cargando.value = false
+                _cargando.value = false
             }
         }
     }

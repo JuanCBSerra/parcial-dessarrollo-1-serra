@@ -169,3 +169,131 @@ Sí. El cambio está **solo en la capa de datos**: las pantallas y el ViewModel 
 
 ### Para defenderlo oralmente
 > "`REPLACE` borraba y reescribía cada fila con la marca en falso, así que cada actualización vaciaba la agenda, y como solo insertaba, las charlas retiradas nunca se iban. Lo reemplacé por una función pura que toma la instantánea nueva como lo único vigente y le copia las marcas por id. La ejecuto dentro de una transacción de Room, leyendo las marcas recién cuando llega la respuesta, así no se pierde ninguna marca hecha durante la petición. No usé `UPDATE` porque no inserta ni borra, ni UPSERT porque no existe en API 26 y el de Room pisa la marca. El esquema no cambió, así que no hace falta migración."
+
+---
+
+## Pedido 41 · Programa sin señal
+
+### Contexto
+La app descarga el programa de internet y lo guarda en el teléfono (base de datos Room). Si después no hay señal, debería poder seguir mostrando lo último que descargó. Hay tres situaciones que la app tiene que distinguir:
+
+| Situación | Qué pide el README |
+|---|---|
+| Ya descargué alguna vez y ahora falla | Seguir mostrando la lista, el detalle y las favoritas, **y avisar** que son datos guardados |
+| Nunca descargué y falla | No hay nada que mostrar → **ofrecer reintento** |
+| Descargué v4, que viene vacía | Mostrar «sin charlas programadas». **Es una edición válida**: si reabro sin señal, sigue siendo eso y no un error |
+
+### Problema
+**1. Un error tapaba la lista.** El catálogo hacía esto:
+
+```kotlin
+if (aviso.isNotEmpty()) {
+    Text(aviso); OutlinedButton(onClick = model::recargar) { Text("Reintentar") }
+} else {
+    Grilla(fichas…)
+}
+```
+
+Si fallaba la red, se mostraba **el error en lugar de la lista**, aunque las charlas estuvieran guardadas en el teléfono. El usuario veía "No se pudo consultar el programa" y no podía ver nada, cuando los datos estaban ahí.
+
+**2. No había forma de saber si "ya descargué alguna vez".** La app solo tenía la tabla de charlas. Una tabla vacía puede significar dos cosas muy distintas:
+- **nunca descargué** → corresponde ofrecer reintento;
+- **descargué v4, que vino vacía** → corresponde mostrar «sin charlas programadas».
+
+Mirando solo las charlas, no hay forma de distinguirlas.
+
+### Qué código cambié
+
+**1. `data/Programa.kt`: una tabla nueva que registra "ya descargué una edición"**
+
+```kotlin
+@Entity(tableName = "edicion")
+data class Edicion(@PrimaryKey val id: Int = 0)
+```
+
+Tiene una sola fila. Si existe, hubo al menos una descarga exitosa, aunque haya traído cero charlas. El DAO suma:
+- `hayEdicion(): Flow<Boolean>`, que observa si esa fila existe;
+- `registrarEdicion()`, que se llama **adentro de `aplicarEdicion`**, en la misma transacción del pedido 42. Así no puede pasar que se guarden las charlas y no la marca, ni al revés.
+
+**2. Migración v1 → v2 (`MIGRACION_1_2`)**
+
+Agregar una tabla cambia el esquema de la base, y la app ya tiene usuarios instalados con charlas y favoritas. Por eso hice una migración incremental, sin borrar nada:
+
+```kotlin
+db.execSQL("CREATE TABLE IF NOT EXISTS `edicion` (`id` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+db.execSQL("INSERT INTO `edicion` (`id`) SELECT 0 WHERE EXISTS (SELECT 1 FROM `charlas`)")
+```
+
+- La primera línea crea la tabla nueva. La tabla `charlas` **no se toca**, así que se conservan el programa y las favoritas.
+- La segunda resuelve un caso fino: un usuario de la versión 1.2 que ya tenía charlas guardadas **ya había descargado una edición**, solo que la app vieja no lo anotaba. Si no se la registrara, al actualizar y abrir sin señal vería "nunca descargaste", con sus charlas guardadas ahí mismo.
+
+En `Servicios.kt` se registra con `.addMigrations(MIGRACION_1_2)`. No se usa `fallbackToDestructiveMigration()`, que borraría todo.
+
+**3. `ui/Cartelera.kt` (nuevo): la regla de qué mostrar, como función pura**
+
+```kotlin
+fun desde(hayEdicion: Boolean, charlas: List<Charla>, ultimaFallo: Boolean): Cartelera = when {
+    hayEdicion  -> Edicion(charlas, datosGuardados = ultimaFallo)  // hay algo guardado: se muestra
+    ultimaFallo -> SinDescarga                                     // nada guardado y falló: reintento
+    else        -> Esperando                                       // nada guardado, esperando la primera respuesta
+}
+```
+
+`Cartelera` es un `sealed interface` con tres estados. La pantalla hace un `when` sobre ellos y **no puede olvidarse de ninguno**: si faltara uno, no compila.
+
+**4. `ui/ProgramaModel.kt`: el ViewModel arma la cartelera**
+
+```kotlin
+val cartelera = combine(repo.hayEdicion, charlas, ultimaFallo) { … Cartelera.desde(…) }
+    .stateIn(viewModelScope, SharingStarted.Eagerly, Cartelera.Esperando)
+```
+
+- `combine` junta tres fuentes y recalcula la cartelera cuando cualquiera cambia: si hay edición (Room), las charlas (Room) y si la última petición falló.
+- Se eliminó `aviso` (un texto suelto) y se reemplazó por `ultimaFallo`, un dato privado. Las pantallas no deciden con un texto: deciden con un estado.
+- `ultimaFallo` **solo cambia cuando termina una petición**, no al empezar. Así, mientras se reintenta, el aviso de datos guardados no parpadea: sigue visible hasta que llega la respuesta.
+- `cargando` pasó a ser privado (`_cargando`) con un `StateFlow` público de solo lectura. Ya que lo tocaba, quedó con la *backing property* que pide la cátedra.
+
+**5. `ui/Catalogo.kt`: la pantalla solo dibuja**
+
+```kotlin
+when (val estado = cartelera) {
+    Cartelera.Esperando   -> Unit
+    Cartelera.SinDescarga -> { Text("No se pudo descargar…"); OutlinedButton(…) { Text("Reintentar") } }
+    is Cartelera.Edicion  -> {
+        if (estado.datosGuardados) Text("Sin conexión: estás viendo los datos guardados.")
+        if (estado.charlas.isEmpty()) Text("Sin charlas programadas") else Grilla(…)
+    }
+}
+```
+
+La diferencia clave con el código anterior: **el aviso de datos guardados va arriba de la lista, no en su lugar.**
+
+El detalle de una charla y Mi agenda no necesitaron cambios: leen de Room, que sigue teniendo los datos aunque falle la red. Lo único que los "tapaba" era el catálogo.
+
+### Qué riesgo resuelvo
+- **El usuario sin señal se quedaba sin programa**, aunque lo tuviera guardado.
+- **Un programa vacío se confundía con "nunca descargué"**, o al revés.
+- **Actualizar la app no borra datos:** la migración conserva charlas y favoritas, y reconoce la descarga previa de quien venía de la 1.2.
+
+### ¿Respeta MVVM?
+- **Datos:** Room guarda si hubo edición, dentro de la misma transacción que las charlas.
+- **ViewModel:** combina las fuentes y expone **un único estado** (`cartelera`), de solo lectura.
+- **Vista:** hace un `when` exhaustivo y dibuja. No decide nada.
+- **Regla pura:** `Cartelera.desde` no depende de Android y se testea en la JVM.
+
+Respeta la regla de la cátedra *"distinguir lista vacía de error: nunca mostrar un error como lista vacía"*, y también al revés: un error no tapa una lista que existe.
+
+### Evidencia
+- **Test JVM:** `app/src/test/java/ar/jornadas/ui/CarteleraTest.kt` cubre los seis casos: edición + falla, edición + éxito, sin descarga + falla, sin descarga + esperando, v4 exitosa y v4 reabierta sin señal.
+- **Manual, con edición previa:** Mesa → v1 → Actualizar → marcá una charla. Apagá «Servicio disponible» → Actualizar. Se ve la lista con «Sin conexión: estás viendo los datos guardados.», la ficha abre y la marca sigue en Mi agenda.
+- **Manual, sin descarga previa:**
+  ```bash
+  adb shell pm clear ar.jornadas
+  adb shell am start -n ar.jornadas/.MainActivity --ez servicio_disponible false
+  ```
+  Se ve «No se pudo descargar el programa» con el botón Reintentar. Prendé el servicio en Mesa, volvé a Programa → Reintentar y aparece la lista.
+- **Manual, v4:** Mesa → v4 → Actualizar → «Sin charlas programadas». Apagá el servicio, cerrá la app desde Recientes y reabrila: sigue «Sin charlas programadas» con el aviso de datos guardados, y **no** el botón de reintento.
+- **Manual, migración:** instalá el APK del commit inicial (base v1), descargá y marcá charlas. Instalá encima esta versión sin desinstalar, apagá el servicio y abrí: siguen las charlas y las marcas, con el aviso de datos guardados.
+
+### Para defenderlo oralmente
+> "El error reemplazaba a la lista, así que sin señal no veías nada aunque el programa estuviera guardado. Además, con solo la tabla de charlas no se distingue 'nunca descargué' de 'descargué un programa vacío'. Agregué una tabla `edicion` que se escribe en la misma transacción que las charlas, con una migración incremental que no borra nada y reconoce a quien ya tenía datos. La decisión de qué mostrar es una función pura con tres estados; el ViewModel la expone como un único `StateFlow` y la pantalla solo hace un `when`. Ahora el aviso va arriba de la lista, no en su lugar."
